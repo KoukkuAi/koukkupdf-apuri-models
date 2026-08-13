@@ -1,0 +1,197 @@
+# Taituri Apuri — NER-mallin ONNX-konversio (vaihe 2b, mallilisenssimuistio §4.2:
+# "ONNX-konversio tehdään ITSE alkuperäisestä Apache 2.0 -mallista").
+#
+# MIKSI CI eikä kehityskone: sama syy kuin sidecarilla — WDAC estää paikalliset
+# binäärit, ja toimitusketju on dokumentoitavampi kun konversion tekee julkinen,
+# lokitettu työnkulku. Tulos = YKSI zip (kvantisoitu ONNX + tokenizer + configit),
+# koska Apurin jakeluputki (modelManifest/modelStore) käsittelee yhden tiedoston
+# yhdellä SHA-256:lla; sovellus purkaa zipin muistissa (jszip on jo riippuvuus).
+#
+# Käynnistys: käsin (workflow_dispatch) — mallijulkaisu on aina tietoinen päätös.
+# Tuloste: artifact `apuri-gliner-model` + job summaryssa SHA-256 ja
+# models.json-rivi valmiina liitettäväksi hostingin /apuri/models.json:iin.
+
+name: apuri-model-convert
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "Hugging Face -mallitunnus (Apache 2.0 -varmistettu; lisenssiselvitys on Koukun sisäisessä dokumentaatiossa)"
+        required: true
+        default: "urchade/gliner_multi-v2.1"
+      version:
+        description: "Julkaistava versionumero (semver; models.json)"
+        required: true
+        default: "1.1.0"
+
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Checkout tarvitaan lisenssitiedostoihin (public/apuri/LICENSE + NOTICE
+      # → jakeluzipin sisään, Apache 2.0 §4(a)/(d); docs/apuri-mallilisenssit.md §5).
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Asenna gliner + onnx-työkalut
+        run: |
+          python -m pip install --upgrade pip
+          pip install gliner onnx onnxruntime
+          python - <<'PY'
+          import gliner, onnx, onnxruntime, torch
+          print("gliner", gliner.__version__)
+          print("onnx", onnx.__version__)
+          print("onnxruntime", onnxruntime.__version__)
+          print("torch", torch.__version__)
+          PY
+
+      - name: Lataa malli ja konvertoi ONNX:ksi (virallinen export_to_onnx, opset 19)
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+        run: |
+          python - <<'PY'
+          import os
+          from gliner import GLiNER
+
+          model_id = os.environ["MODEL_ID"]
+          out = "model_out"
+          print(f"Ladataan {model_id} …")
+          model = GLiNER.from_pretrained(model_id)
+          model.save_pretrained(out)
+          print("Eksportoidaan ONNX (quantize=True, opset=19) …")
+          model.export_to_onnx(
+              save_dir=out,
+              onnx_filename="model.onnx",
+              quantized_filename="model_quantized.onnx",
+              quantize=True,
+              opset=19,
+          )
+          print("Valmis. Hakemiston sisältö:")
+          for root, _, files in os.walk(out):
+              for f in files:
+                  p = os.path.join(root, f)
+                  print(f"  {p}  {os.path.getsize(p)/1e6:.1f} MB")
+          PY
+
+      - name: Paketoi jakeluzip (fp32 ONNX + tokenizer + configit)
+        env:
+          MODEL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist_pkg
+          # fp32-malli (EI int8/kvantisointia): Chromiumin wasm-runtime laskee
+          # kvantisoidut (int8/4-bit) kernelit alennetulla tarkkuudella (relaxed-SIMD)
+          # → recall katossa ~82 %; vain aito fp32 säilyttää laskennan → ≥90 %.
+          # Ks. muistio koukku-pdf-apuri-runtime-precision. Konsolidoidaan yhdeksi
+          # self-contained-tiedostoksi: gliner.js lataa mallin Uint8Arrayna puretusta
+          # zipistä, joten ulkoista .onnx_data:aa ei saa olla.
+          F=$(find model_out -name 'model.onnx' | head -1)
+          test -n "$F" || { echo "model.onnx (fp32) puuttuu"; exit 1; }
+          python - "$F" <<'PY'
+          import sys, os, onnx
+          m = onnx.load(sys.argv[1])  # lataa myös mahdollisen ulkoisen datan
+          onnx.save(m, "dist_pkg/model.onnx", save_as_external_data=False)
+          print(f"fp32 model.onnx konsolidoitu: {os.path.getsize('dist_pkg/model.onnx')/1e6:.0f} MB")
+          PY
+          # Tokenizer + konfiguraatiot (GLiNER.js tarvitsee nämä) — EI painotiedostoja.
+          for f in gliner_config.json config.json tokenizer.json tokenizer_config.json \
+                   special_tokens_map.json spm.model sentencepiece.bpe.model added_tokens.json; do
+            src=$(find model_out -maxdepth 2 -name "$f" | head -1)
+            if [ -n "$src" ]; then cp "$src" "dist_pkg/$f"; fi
+          done
+          # Apache 2.0 -velvoitteet: lisenssiteksti + attribuutio mallin mukana
+          # (sama lähde kuin /apuri/-jakelupolulla — yksi totuus repossa).
+          cp public/apuri/LICENSE dist_pkg/LICENSE
+          cp public/apuri/NOTICE dist_pkg/NOTICE
+          ls -lh dist_pkg
+          ZIP="apuri-gliner-multi-${MODEL_VERSION}.zip"
+          (cd dist_pkg && zip -9 -r "../$ZIP" .)
+          ls -lh "$ZIP"
+
+      - name: SHA-256 + models.json-rivi job summaryyn
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+          MODEL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ZIP="apuri-gliner-multi-${MODEL_VERSION}.zip"
+          SHA=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$ZIP")
+          {
+            echo "## Apuri-mallipaketti valmis"
+            echo ""
+            echo "| Kenttä | Arvo |"
+            echo "|---|---|"
+            echo "| Lähdemalli | \`$MODEL_ID\` (Apache-2.0, lisenssiselvitys on Koukun sisäisessä dokumentaatiossa) |"
+            echo "| Tiedosto | \`$ZIP\` |"
+            echo "| Koko | $SIZE tavua |"
+            echo "| SHA-256 | \`$SHA\` |"
+            echo ""
+            echo '### models.json-rivi (liitä /apuri/models.json:iin)'
+            echo '```json'
+            cat <<JSON
+          {
+            "id": "gliner-multi",
+            "version": "${MODEL_VERSION}",
+            "kind": "ner",
+            "name": "Nimitunnistus (monikielinen GLiNER v2.1, fp32)",
+            "sizeBytes": ${SIZE},
+            "sha256": "${SHA}",
+            "url": "${ZIP}",
+            "license": "Apache-2.0",
+            "minRamGb": 16
+          }
+          JSON
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Artifactiin mukaan myös kuittitiedosto.
+          sha256sum "$ZIP" > "$ZIP.sha256"
+
+      - name: Lataa artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: apuri-gliner-model
+          path: |
+            apuri-gliner-multi-*.zip
+            apuri-gliner-multi-*.zip.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── JULKAISU ────────────────────────────────────────────────────────────
+      # Tämä työnkulku ASUU jakelurepossa, joten sen oma GITHUB_TOKEN riittää
+      # julkaisuun. Aiemmin muunnos ajettiin sovellusrepossa ja julkaisu olisi
+      # vaatinut ristirepotunnuksen — se poistettiin siirtämällä työnkulku tänne.
+      # Vähemmän salaisuuksia on vähemmän hallittavaa ja vähemmän vuodettavaa.
+      #
+      # 🔴 MIKSI JULKAISUASKEL ON OLEMASSA. Alkuperäinen työnkulku päättyi
+      # artifactiin. Joku olisi pitänyt käydä hakemassa se ja viemässä
+      # palvelimelle käsin — sitä ei koskaan tehty, eikä mikään kertonut siitä.
+      # models.json lupasi mallin osoitteesta jota ei ollut, ja Apurin lataus
+      # epäonnistui jokaisella käyttäjällä lähes kuukauden ajan. Putki joka
+      # rakentaa muttei julkaise on putki jonka viimeinen askel unohtuu.
+      - name: Julkaise
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ZIP="apuri-gliner-multi-${MODEL_VERSION}.zip"
+          TAG="gliner-multi-${MODEL_VERSION}"
+          gh release view "$TAG" >/dev/null 2>&1             || gh release create "$TAG"                  --title "GLiNER multi v2.1 — ${MODEL_VERSION}"                  --notes "Koukku Taiturin Apuri-nimitunnistusmalli. Lahde: urchade/gliner_multi-v2.1, Apache-2.0. SHA-256 ja koko: ks. liitteet."
+          gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber
+          echo "Julkaistu: $TAG/$ZIP" >> "$GITHUB_STEP_SUMMARY"
+
+      # Todenna heti ettei tiedosto jaa saavuttamattomaksi. Sama tarkistus
+      # ajetaan sovellusrepon CI:ssa jokaisella ajolla.
+      - name: Todenna etta malli on ladattavissa
+        run: node scripts/tarkista-mallijulkaisu.mjs
