@@ -1,0 +1,18 @@
+Koukku Taituri — Apuri-nimitunnistusmalli (NOTICE)
+
+Tämä jakelu sisältää seuraavat kolmannen osapuolen komponentit:
+
+GLiNER multi v2.1 (nimientiteettitunnistusmalli)
+  © Urchade Zaratiana ja tekijät
+  Lisenssi: Apache License 2.0 (ks. LICENSE-tiedosto tässä hakemistossa)
+  Lähde: https://huggingface.co/urchade/gliner_multi-v2.1
+
+mDeBERTa-v3-base (pohjamalli, sisältyy yllä olevaan)
+  © Microsoft Corporation
+  Lisenssi: MIT
+  Lähde: https://huggingface.co/microsoft/mdeberta-v3-base
+
+Muutokset (Apache 2.0 §4(b)): Koukku on konvertoinut mallin ONNX-muotoon
+(fp32, ilman kvantisointia) jakelua varten. Konversio on tehty julkisella,
+lokitetulla CI-työnkululla (apuri-model-convert.yml); paketin eheys
+todennetaan SHA-256-tarkistussummalla (models.json).
